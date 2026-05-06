@@ -133,10 +133,11 @@ def time_simd_dw(W_csr: PaddedCSR, dY: np.ndarray, X: np.ndarray) -> float:
 
     On ARM64 (Apple Silicon, Linux aarch64) this runs our hand-written
     NEON kernel and lands at ~6x the throughput of the scalar column
-    on FFN shapes (see milestone_12). On x86_64 the _simd binding
-    falls back to the scalar kernel — there is no hand-written AVX
-    kernel yet (issue #2). Running this script on an x86 runner
-    therefore produces si/sc ~= 1.0 across all shapes.
+    on FFN shapes (see milestone_12). On x86_64 as of milestone 14,
+    this runs the hand-written AVX2 kernel and lands at ~12-13x over
+    the scalar dW column on FFN shapes. On pre-AVX2 x86 (theoretically
+    unreachable since setup.py sets -march=x86-64-v3) it falls back
+    to scalar.
     """
     for _ in range(N_WARMUP):
         _core.spmm_grad_w_simd(W_csr, dY, X)
@@ -145,6 +146,42 @@ def time_simd_dw(W_csr: PaddedCSR, dY: np.ndarray, X: np.ndarray) -> float:
     for _ in range(N_RUNS):
         t0 = time.perf_counter()
         _core.spmm_grad_w_simd(W_csr, dY, X)
+        samples.append((time.perf_counter() - t0) * 1000.0)
+    return stats.median(samples)
+
+
+def time_scalar_fwd(W_csr: PaddedCSR, X: np.ndarray) -> float:
+    """Median wallclock for one spmm_scalar (forward Y = W @ X), ms.
+
+    Added for the forward AVX2 kernel spec — mirror of time_scalar_dw
+    but on the forward path. Takes the same (W_csr, X) inputs and
+    returns a fresh Y; each call is independent, no allocator reuse.
+    """
+    for _ in range(N_WARMUP):
+        _core.spmm_scalar(W_csr, X)
+
+    samples = []
+    for _ in range(N_RUNS):
+        t0 = time.perf_counter()
+        _core.spmm_scalar(W_csr, X)
+        samples.append((time.perf_counter() - t0) * 1000.0)
+    return stats.median(samples)
+
+
+def time_simd_fwd(W_csr: PaddedCSR, X: np.ndarray) -> float:
+    """Median wallclock for one spmm_simd (forward, SIMD path), ms.
+
+    On ARM64: routes to spmm_simd_neon (shipped since milestone 3d).
+    On x86_64 post-milestone-15: routes to spmm_simd_avx2 (this spec).
+    On pre-AVX2 x86: falls back to scalar.
+    """
+    for _ in range(N_WARMUP):
+        _core.spmm_simd(W_csr, X)
+
+    samples = []
+    for _ in range(N_RUNS):
+        t0 = time.perf_counter()
+        _core.spmm_simd(W_csr, X)
         samples.append((time.perf_counter() - t0) * 1000.0)
     return stats.median(samples)
 
@@ -188,6 +225,19 @@ def compute_flops(M: int, K: int, N: int, nnz: int) -> int:
     return 2 * N * nnz
 
 
+def compute_flops_fwd(M: int, K: int, N: int, nnz: int) -> int:
+    """FLOPs for forward Y = W @ X: per live slot (i, c, v), we do
+    one N-length scaled add into Y[i, :] — N multiplies + N adds =
+    2N flops. With nnz slots, total work = 2 * N * nnz.
+
+    Same arithmetic intensity per slot as dW — the kernels do the
+    same number of floating-point ops; what differs is compute-vs-
+    memory-boundedness (dW accumulates to a scalar, forward writes
+    through to memory every iteration).
+    """
+    return 2 * N * nnz
+
+
 def format_gflops(flops: int, ms: float) -> str:
     if ms <= 0:
         return "   n/a"
@@ -200,59 +250,77 @@ def format_gflops(flops: int, ms: float) -> str:
 # ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print("SparseLab — dW kernel baseline measurement")
-    print("(Gate 1 for GitHub issue #1: NEON dW kernel)")
-    print("=" * 96)
+    print("SparseLab — dW + forward SpMM kernel baseline measurement")
+    print("(Gate 1 for issues #1 (NEON dW), #2 (AVX2 dW + forward))")
+    print("=" * 128)
     print(f"Torch threads: {torch.get_num_threads()}   "
           f"Runs: {N_RUNS} (median)   Warmup: {N_WARMUP}")
     print()
-    print(f"{'Shape':<55} {'scalar':>8} {'simd':>8} {'dense':>8} "
-          f"{'si/sc':>7} {'s.GF/s':>8}")
-    print(f"{'':<55} {'(ms)':>8} {'(ms)':>8} {'(ms)':>8} "
-          f"{'':>7} {'':>8}")
-    print("-" * 96)
+    # Two logical blocks per row: dW columns, then forward columns.
+    # Fits ~128 chars wide; scalar/simd in ms; GF/s for both scalar
+    # rates so they can be compared at a glance.
+    print(f"{'Shape':<55} "
+          f"{'dw.sc':>7} {'dw.si':>7} {'dw.si/sc':>8} {'dw.GF':>7}   "
+          f"{'fw.sc':>7} {'fw.si':>7} {'fw.si/sc':>8} {'fw.GF':>7}")
+    print(f"{'':<55} "
+          f"{'(ms)':>7} {'(ms)':>7} {'':>8} {'s.s':>7}   "
+          f"{'(ms)':>7} {'(ms)':>7} {'':>8} {'s.s':>7}")
+    print("-" * 128)
 
     for M, K, N, s, label in SHAPES:
         W_csr, W_dense, dY, X = make_inputs(M, K, N, s)
 
-        t_scalar = time_scalar_dw(W_csr, dY, X)
-        t_simd   = time_simd_dw(W_csr, dY, X)
-        t_dense  = time_dense_oracle(W_dense, dY, X)
-        si_over_sc = t_simd / t_scalar if t_scalar > 0 else float("inf")
+        # dW timings
+        t_dw_scalar = time_scalar_dw(W_csr, dY, X)
+        t_dw_simd   = time_simd_dw(W_csr, dY, X)
+        dw_si_over_sc = t_dw_simd / t_dw_scalar if t_dw_scalar > 0 else float("inf")
+
+        # Forward timings — same (W_csr, X) inputs, fresh Y per call.
+        t_fw_scalar = time_scalar_fwd(W_csr, X)
+        t_fw_simd   = time_simd_fwd(W_csr, X)
+        fw_si_over_sc = t_fw_simd / t_fw_scalar if t_fw_scalar > 0 else float("inf")
 
         nnz = W_csr.nnz
-        flops = compute_flops(M, K, N, nnz)
+        dw_flops = compute_flops(M, K, N, nnz)
+        fw_flops = compute_flops_fwd(M, K, N, nnz)
 
-        print(f"{label:<55} {t_scalar:>8.2f} {t_simd:>8.2f} {t_dense:>8.2f} "
-              f"{si_over_sc:>6.2f}x "
-              f"{format_gflops(flops, t_scalar):>8}")
+        print(f"{label:<55} "
+              f"{t_dw_scalar:>7.2f} {t_dw_simd:>7.2f} "
+              f"{dw_si_over_sc:>7.2f}x {format_gflops(dw_flops, t_dw_scalar):>7}   "
+              f"{t_fw_scalar:>7.2f} {t_fw_simd:>7.2f} "
+              f"{fw_si_over_sc:>7.2f}x {format_gflops(fw_flops, t_fw_scalar):>7}")
 
-    print("=" * 96)
+    print("=" * 128)
+    print()
+    print("Column legend:")
+    print("  dw.sc / dw.si  — scalar / SIMD spmm_grad_w ms (dL/dW kernel)")
+    print("  fw.sc / fw.si  — scalar / SIMD spmm ms (forward Y = W @ X)")
+    print("  .si/sc         — simd / scalar ratio (smaller is better)")
+    print("  .GF            — scalar GF/s throughput on that path")
     print()
     print("How to interpret these numbers:")
     print()
-    print("  simd/scalar ratio (si/sc):")
-    print("    On ARM64 (Apple Silicon, Linux aarch64) we expect")
-    print("    ~0.15-0.20 — the hand-written NEON kernel is ~5-6x")
-    print("    faster than scalar on FFN shapes.")
-    print("    On x86_64 we expect ~1.0 — the _simd binding falls")
-    print("    back to scalar (AVX kernel is issue #2, not yet built).")
+    print("  simd/scalar ratio (si/sc) — dW column:")
+    print("    On ARM64 (Apple Silicon, Linux aarch64) ~0.15-0.20 —")
+    print("    NEON dW kernel is ~5-6x faster than scalar on FFN")
+    print("    shapes (milestone 12). On x86_64 post-milestone-14:")
+    print("    ~0.08 (~12-13x speedup via AVX2 dW kernel).")
     print()
-    print("  scalar / dense ratio:")
-    print("    How much slower our sparse-aware scalar kernel is than a")
-    print("    full dense torch.matmul on the same shape. Because we do")
-    print("    (1 - sparsity) x less arithmetic, ratios > 1 indicate")
-    print("    per-FLOP inefficiency we can recover with SIMD.")
+    print("  simd/scalar ratio (si/sc) — forward column:")
+    print("    On ARM64: ~0.15-0.20 (NEON forward from milestone 3d).")
+    print("    On x86_64 post-milestone-15 (this spec): target ~0.15-0.20")
+    print("    (~5-6x via AVX2 forward kernel, memory-bandwidth-bound).")
+    print("    On pre-AVX2 x86: ~1.0 (simd falls back to scalar).")
     print()
-    print("  s.GF/s (scalar throughput):")
-    print("    Our kernel's actual arithmetic rate. Rough ceilings:")
+    print("  s.GF/s (scalar throughput) — unchanged interpretation:")
+    print("    Rough ceilings:")
     print("    - Apple M-series f32: ~150-200 GF/s (NEON)")
     print("    - Intel Sapphire Rapids f32: ~100-150 GF/s (AVX-512)")
     print("    - AMD Zen 4 f32:            ~80-120 GF/s (AVX2)")
     print("    Decision rule for new SIMD work:")
-    print("      < 30 GF/s  -> scalar / no auto-vec, hand kernel worth writing")
+    print("      < 30 GF/s  -> hand-written kernel worth writing")
     print("      30-80 GF/s -> partial auto-vec, some headroom")
-    print("      > 80 GF/s  -> compiler already vectorized well, invest elsewhere")
+    print("      > 80 GF/s  -> compiler already vectorized well")
 
 
 if __name__ == "__main__":
