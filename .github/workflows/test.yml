@@ -88,9 +88,30 @@ jobs:
       - name: Install SparseLab and dev dependencies
         # Editable install so the compiled extension lives alongside
         # the source; runs on the current branch's kernel code.
-        # --no-build-isolation uses the system Python's torch / pybind11
-        # rather than spinning up a clean build environment each time —
-        # ~2× faster on CI and matches what contributors do locally.
+        #
+        # --no-build-isolation: required, especially on macOS.
+        #
+        # On macOS, setup.py's BuildExtWithRepair rewrites the .so's
+        # libomp install_name to the absolute path of torch's bundled
+        # libomp (issue #18 fix). For that path to be valid at runtime,
+        # the torch importable from setup.py at *build time* must be
+        # the same torch the user imports at *runtime*. With build
+        # isolation, pip creates a fresh build environment with its
+        # own ephemeral torch — the absolute path baked into the .so
+        # would point at a torch that gets deleted post-install, and
+        # the editable install would ImportError on its very first
+        # import.
+        #
+        # On Linux, --no-build-isolation also speeds up builds (~2×)
+        # and matches what contributors run locally. See
+        # docs/development.md for the canonical editable-install
+        # command and CONTRIBUTING.md for the dev quickstart.
+        #
+        # We pre-install torch + pybind11 + setuptools + wheel so
+        # --no-build-isolation has the build deps available. (Without
+        # --no-build-isolation, pip would install them into the
+        # isolated build env automatically; with it, we install them
+        # into the runtime env instead — same torch in both phases.)
         #
         # ARCHFLAGS on macOS forces a single-arch build. GitHub's
         # macos-14 runners install a universal2 Python by default,
@@ -103,7 +124,11 @@ jobs:
           ARCHFLAGS: ${{ runner.os == 'macOS' && '-arch arm64' || '' }}
         run: |
           python -m pip install --upgrade pip
-          pip install -e .[dev] -v
+          # Build deps installed into the runtime env explicitly,
+          # because --no-build-isolation skips the implicit install
+          # that pip would otherwise do into an ephemeral build env.
+          pip install --upgrade setuptools wheel pybind11 'torch>=2.8'
+          pip install -e .[dev] -v --no-build-isolation
 
       - name: Inspect editable .so linkage (macOS diagnostic for #18)
         # Diagnostic-only step. Prints the macOS .so's linked dylibs

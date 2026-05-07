@@ -304,16 +304,81 @@ class BuildExtWithRepair(build_ext):
         if homebrew_libomp is None:
             return  # already @rpath-style, or no libomp linked
 
+        # Issue #18 fix
+        # ─────────────
+        # macOS does NOT fall back to the flat process namespace when
+        # `@rpath/libomp.dylib` fails to resolve to a real file — it
+        # raises ImportError. So the install_name we bake in MUST be
+        # resolvable at runtime.
+        #
+        # Two cases:
+        #
+        # (1) WHEEL build path. cibuildwheel calls
+        #     scripts/repair_wheel_macos.sh post-build; that script
+        #     leaves install_name = @rpath/libomp.dylib and adds the
+        #     relative rpath `@loader_path/../torch/lib`, which works
+        #     because in the *installed wheel layout*
+        #     site-packages/sparselab/_core.so → site-packages/torch/lib
+        #     resolves cleanly. We must NOT bake an absolute path into
+        #     wheel builds — the path wouldn't exist on the user's
+        #     machine. The wheel repair script handles that case.
+        #
+        # (2) EDITABLE install path (`pip install -e .`). The .so lives
+        #     in <repo>/sparselab/_core.so and torch is far away in
+        #     site-packages, so `@loader_path/../torch/lib` resolves
+        #     to <repo>/torch/lib — which doesn't exist. To make the
+        #     .so loadable we bake an ABSOLUTE path to the build-time
+        #     torch's libomp directly into install_name. This works
+        #     because:
+        #       • Editable .so files never get distributed; they live
+        #         in your repo only. An absolute path baked into a
+        #         local-only .so is fine.
+        #       • `pip install -e . --no-build-isolation` uses the
+        #         CURRENT environment's torch as the build-time torch,
+        #         so the absolute path is the same torch the user
+        #         imports at runtime.
+        #
+        # The detector below: if torch is importable at build time AND
+        # `torch/lib/libomp.dylib` exists on disk, we take case (2)
+        # and bake the absolute path. Otherwise we take case (1) and
+        # leave it as `@rpath/libomp.dylib` for the wheel repair
+        # script to finalize.
+        #
+        # IMPORTANT for developers: macOS editable installs MUST be run
+        # with `pip install -e .[dev] --no-build-isolation` so that
+        # `import torch` in setup.py reaches the runtime torch (not an
+        # isolated build-env torch with a different path). See
+        # CONTRIBUTING.md and docs/development.md for the canonical
+        # editable-install command.
+        editable_install_target = None
+        if IS_MACOS:
+            try:
+                import torch  # type: ignore
+                _torch_libomp = os.path.join(
+                    os.path.dirname(torch.__file__), "lib", "libomp.dylib"
+                )
+                if os.path.isfile(_torch_libomp):
+                    editable_install_target = _torch_libomp
+            except ImportError:
+                pass
+
+        new_install_name = editable_install_target or "@rpath/libomp.dylib"
         print(
             f"[sparselab] rewriting libomp install name: "
-            f"{homebrew_libomp} -> @rpath/libomp.dylib",
+            f"{homebrew_libomp} -> {new_install_name}",
             file=sys.stderr,
         )
         subprocess.run(
             ["install_name_tool", "-change",
-             homebrew_libomp, "@rpath/libomp.dylib", so_path],
+             homebrew_libomp, new_install_name, so_path],
             check=True,
         )
+
+        # If we baked an absolute editable-install path, we're done —
+        # no rpath needed because the install_name is a literal,
+        # self-resolving path. Skip the rpath additions below.
+        if editable_install_target is not None:
+            return
 
         # Add an rpath pointing at torch's bundled libomp.
         #

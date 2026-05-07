@@ -120,16 +120,26 @@ cd sparselab
 # macOS only (for OpenMP):
 brew install libomp
 
-# Install in editable mode with dev deps
-pip install -e '.[dev]'
+# Pre-install build deps into the runtime env, then editable install
+# with --no-build-isolation. This is REQUIRED on macOS — see
+# docs/development.md for the full reasoning. Linux developers can
+# get away without --no-build-isolation but it's faster and we
+# recommend the same command on every platform for consistency.
+pip install --upgrade setuptools wheel pybind11 'torch>=2.8'
+pip install -e '.[dev]' --no-build-isolation
 
 # Run the test suite
 pytest
-# Expected: 372 passed in ~3s
+# Expected: 442 passed, 92 skipped, ~4s on Apple Silicon
 ```
 
 The editable install rebuilds the C++ kernels whenever you touch a
 file in `csrc/`. First build takes ~45 seconds.
+
+**If `pip install -e '.[dev]'` fails with `ImportError: Library not
+loaded: @rpath/libomp.dylib` on macOS**, you forgot
+`--no-build-isolation`. See [docs/development.md](docs/development.md)
+for the explanation; the fix is to re-run with the flag.
 
 ### Running demos
 
