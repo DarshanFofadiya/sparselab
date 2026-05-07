@@ -1,5 +1,22 @@
 # Design — AVX2 SIMD Kernel for Sparse Forward SpMM (`spmm_simd`, x86)
 
+> **Status: RETIRED (2026-05-07).** Gate F1 measured only 1.20–1.33×
+> per-layer speedup on Zen 4 vs auto-vectorized scalar forward at
+> ~50 GF/s — well below the 5× ship floor. The
+> `-march=x86-64-v3` flag added in
+> [milestone 14](../demos/milestone_14.md) Phase 0 enabled Clang's
+> auto-vectorizer on the forward AXPY inner loop, absorbing most of
+> the headroom this spec targeted. See
+> [milestone 15](../demos/milestone_15.md) for measured numbers and
+> the retirement rationale. The analysis below is preserved for
+> future reference — if AVX-512 or a different layout revisits the
+> problem in v0.3, the bandwidth-ceiling analysis in §6.2 and the
+> dual-stream rationale in §3.3 are still useful starting points.
+> Note: §6.2's projection of ~10 GF/s/core L1 ceiling was
+> conservative — measured ~50 GF/s aggregate is closer to the actual
+> Zen 4 store-port limit. Risk 7.4 ("Clang x86 auto-vec on forward
+> inner loop") is the materialized risk, exactly as anticipated.
+
 Sibling of [`spmm_backward_avx2.md`](spmm_backward_avx2.md).
 Companion to [`spmm.md`](spmm.md), which covers the math and the
 scalar kernel. This doc covers the AVX2 implementation shipped

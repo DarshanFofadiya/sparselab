@@ -1,6 +1,28 @@
 """
 AVX2-specific tests for spmm_simd (forward SpMM) on x86_64.
 
+Status (post-milestone-15)
+──────────────────────────
+The hand-written AVX2 forward kernel was retired in milestone 15
+(see docs/demos/milestone_15.md) after Gate F1 measured only
+1.20–1.33× per-layer speedup vs scalar — well below the 5× ship
+floor. Clang's auto-vectorizer under -march=x86-64-v3 (added in
+milestone 14) already covers the forward AXPY inner loop and
+delivers ~50 GF/s scalar on Zen 4, saturating the same store-port
+limit any AVX2 implementation hits.
+
+After retirement, on x86_64 _core.spmm_simd falls through to
+spmm_scalar (the auto-vectorized scalar path). The 46 tests below
+therefore trivially pass — both the "scalar" and "simd" paths in
+this file route to the same kernel. This file is kept as a
+future-proofing asset: when v0.3 revisits x86 SIMD (AVX-512 port
+or a different layout), the N % 16 residue sweep, OpenMP
+determinism check, and structural edge cases below are still the
+right correctness scaffold to rebuild against. Restoring meaningful
+coverage at that point is a single commit (re-enable a hand-written
+kernel + its #elif dispatch branch in bindings.cpp) — none of the
+test logic needs to change.
+
 Purpose
 ───────
 tests/test_spmm.py parametrizes the 23 oracle tests over both scalar

@@ -85,6 +85,26 @@ Closes #2.
   the AVX2 kernel on every push. Linux aarch64's NEON numbers
   verified unchanged vs milestone 13 (si/sc within 5%).
 
+### Investigated but not shipped
+- **Hand-written AVX2 forward SpMM kernel.** Designed, implemented,
+  measured, and retired across milestones 14–15. Gate F1 showed the
+  hand-written kernel only delivered 1.20–1.33× per-layer over
+  scalar on Zen 4 — far below the 5× ship floor. The cause: this
+  release's `-march=x86-64-v3` flag (added for the dW kernel) also
+  unlocked Clang's auto-vectorizer on the forward AXPY inner loop,
+  which now runs at ~50 GF/s scalar — saturating the same Zen 4
+  store-port limit any AVX2 implementation hits. Retirement was a
+  forward-chore commit; the kernel is gone, the dispatch reverts,
+  the Phase A/B/C history stays in the log. As a side effect, this
+  is the first release where x86 forward SpMM is genuinely fast
+  end-to-end: a ~13× scalar speedup over the milestone-13 pre-flag
+  baseline, attributable to the `-march` flag from milestone 14
+  but only measured at milestone 15. See
+  [`docs/demos/milestone_15.md`](docs/demos/milestone_15.md) for
+  measured numbers, methodology, and the v0.3 scoping implication
+  (AVX-512 forward likely also not worth shipping for the same
+  bandwidth-ceiling reason).
+
 ## [0.2.1] — 2026-04-27
 
 **NEON SIMD kernel for `dW` (sparse weight gradient) — the single
