@@ -235,14 +235,41 @@ def test_spmm_rejects_wrong_X_type():
         sparselab.spmm(W_csr, np.random.randn(16, 4).astype(np.float32))
 
 
+def _usable_non_cpu_device() -> str | None:
+    """
+    Return "cuda" / "mps" if a non-CPU device is actually usable for
+    tensor allocation, else None.
+
+    Why probe instead of just checking is_available(): on the GitHub
+    macos-14 CI runner, `torch.backends.mps.is_available()` returns
+    True but `torch.randn(..., device="mps")` segfaults the process —
+    the runner advertises MPS but doesn't actually have a GPU device
+    behind it. A try/except around a 1-element allocation gives a
+    truthful answer in both directions.
+    """
+    if torch.cuda.is_available():
+        try:
+            torch.zeros(1, device="cuda")
+            return "cuda"
+        except Exception:
+            pass
+    if torch.backends.mps.is_available():
+        try:
+            torch.zeros(1, device="mps")
+            return "mps"
+        except Exception:
+            pass
+    return None
+
+
 @pytest.mark.skipif(
-    not (torch.cuda.is_available() or torch.backends.mps.is_available()),
-    reason="No non-CPU device available to test the rejection path",
+    _usable_non_cpu_device() is None,
+    reason="No non-CPU device available (or device advertised but allocation fails)",
 )
 def test_spmm_rejects_non_cpu_X():
     """CPU-only for v0.1. A GPU/MPS tensor must be rejected explicitly."""
     W_csr, _ = _make_sparse_W(8, 16, sparsity=0.5)
-    device = "cuda" if torch.cuda.is_available() else "mps"
+    device = _usable_non_cpu_device()
     X = torch.randn(16, 4, device=device)
     with pytest.raises(RuntimeError, match="CPU"):
         sparselab.spmm(W_csr, X)
