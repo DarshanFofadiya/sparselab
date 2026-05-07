@@ -105,6 +105,36 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .[dev] -v
 
+      - name: Inspect editable .so linkage (macOS diagnostic for #18)
+        # Diagnostic-only step. Prints the macOS .so's linked dylibs
+        # and rpath search list, plus the runtime torch path. Used to
+        # determine which of the candidate libomp the loader is
+        # actually resolving to in the editable-install path. No
+        # behavior change; `set +e` so a missing .so doesn't kill the
+        # job before the verify step runs.
+        if: runner.os == 'macOS'
+        run: |
+          set +e
+          SO=$(find sparselab -name "_core*.so" -print -quit)
+          echo "── .so path: $SO"
+          echo "── otool -L (linked dylibs):"
+          otool -L "$SO" | sed 's/^/   /'
+          echo "── otool -l | LC_RPATH (runtime search paths, in order):"
+          otool -l "$SO" | awk '/cmd LC_RPATH/{getline; getline; print "   " $0}'
+          echo "── runtime torch:"
+          python -c "import torch, os; print(' ', torch.__file__); print(' ', os.path.join(os.path.dirname(torch.__file__), 'lib'))"
+          echo "── DYLD-loaded libomp candidates that exist on disk:"
+          for p in \
+            "/opt/homebrew/opt/libomp/lib/libomp.dylib" \
+            "$(python -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib", "libomp.dylib"))')" ; do
+            if [ -f "$p" ]; then
+              echo "   present: $p"
+              shasum -a 256 "$p" | sed 's/^/     sha256: /'
+            else
+              echo "   absent : $p"
+            fi
+          done
+
       - name: Verify install + SIMD path
         # Sanity-check: the right SIMD kernel is wired up on this
         # platform. Prints a one-line status the artifact can grep.
