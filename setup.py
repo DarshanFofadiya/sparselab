@@ -165,14 +165,33 @@ def configure_openmp() -> tuple[list[str], list[str], list[str]]:
             print(msg, file=sys.stderr)
             return [], [], []
 
-        # Link strategy: prefer PyTorch's bundled libomp if we can find
-        # it, otherwise Homebrew's. Using `-rpath` tells the macOS
-        # dynamic loader where to search at runtime.
+        # Link strategy: link against libomp at link time (so the
+        # linker can resolve `-lomp`), but DO NOT bake any rpath into
+        # the .so. The post-build `BuildExtWithRepair` step (and
+        # scripts/repair_wheel_macos.sh for the wheel path) rewrites
+        # the install_name to `@rpath/libomp.dylib`. With zero rpaths
+        # in the binary, the macOS dynamic loader falls back to the
+        # global flat namespace at import time — and `sparselab/__init__.py`
+        # imports torch first, which loads torch's bundled libomp into
+        # that namespace. The flat-namespace lookup of `libomp.dylib`
+        # then resolves to torch's copy. One libomp in the process,
+        # no OMP error #15, no segfault from two distinct libomps.
         #
-        # We always add Homebrew's libomp prefix as a FALLBACK rpath
-        # too. That way, if a user somehow imports sparselab without
-        # torch first (unusual — sparselab always imports torch in
-        # its __init__), the dynamic loader still finds a libomp.
+        # Why we previously added `-Wl,-rpath,$hb_lib` here: as a
+        # fallback for editing-flow imports without torch loaded
+        # first. In practice that scenario is unreachable —
+        # `sparselab/__init__.py` unconditionally imports torch
+        # before _core.so loads — and the rpath caused issue #18:
+        # on the GitHub macos-14 CI runner an editable install
+        # ended up with ONLY the Homebrew rpath surviving in the
+        # final .so, redirecting `@rpath/libomp.dylib` to a
+        # different libomp than torch's, abort()-ing the process.
+        # See docs/demos/milestone_15.md history (issue #18 fix
+        # commit) for the diagnostic that nailed this down.
+        #
+        # We still need `-L<libomp_lib_dir>` so the LINKER can
+        # resolve the symbol references when producing the .so.
+        # That `-L` does NOT add an rpath; it's link-time-only.
         #
         # include_path here is "<homebrew-prefix>/libomp/include"
         # (e.g. /opt/homebrew/opt/libomp/include). Strip ONE level to
@@ -184,29 +203,25 @@ def configure_openmp() -> tuple[list[str], list[str], list[str]]:
         hb_prefix = os.path.dirname(include_path)
         hb_lib = os.path.join(hb_prefix, "lib")
 
-        link_args: list[str] = []
+        # Prefer torch's libomp if it's importable at build time
+        # (e.g. `pip install -e . --no-build-isolation` from a venv
+        # that already has torch). With build isolation, torch is
+        # not present here and we fall back to Homebrew's libomp at
+        # link time — but either way no rpath is baked into the
+        # binary, so runtime resolution is identical.
+        link_lib_dir = hb_lib
         try:
             import torch  # type: ignore
             torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
             if os.path.isfile(os.path.join(torch_lib, "libomp.dylib")):
-                # Search torch/lib FIRST so we resolve to the same libomp
-                # torch itself loaded. Homebrew's libomp is the fallback.
-                link_args = [
-                    "-L" + torch_lib,
-                    "-Wl,-rpath," + torch_lib,
-                    "-Wl,-rpath," + hb_lib,
-                    "-lomp",
-                ]
+                link_lib_dir = torch_lib
         except ImportError:
             pass
 
-        if not link_args:
-            # No torch at build time: just use Homebrew's libomp.
-            link_args = [
-                "-L" + hb_lib,
-                "-Wl,-rpath," + hb_lib,
-                "-lomp",
-            ]
+        link_args = [
+            "-L" + link_lib_dir,
+            "-lomp",
+        ]
 
         return (
             ["-Xpreprocessor", "-fopenmp"],
@@ -300,8 +315,16 @@ class BuildExtWithRepair(build_ext):
             check=True,
         )
 
-        # Add an rpath pointing at torch's bundled libomp, the one
-        # torch will have already loaded by the time we import.
+        # Add an rpath pointing at torch's bundled libomp.
+        #
+        # NOTE (issue #18 fix): the install_name rewrite above is the
+        # load-bearing piece. With install_name = @rpath/libomp.dylib
+        # and zero rpaths, the macOS dynamic loader falls back to the
+        # global flat namespace, where torch's libomp has already been
+        # loaded by `import torch` in sparselab/__init__.py. That's
+        # what actually saves us. The rpath additions below are
+        # belt-and-suspenders — they help if they survive into the
+        # final .so, and don't hurt if they don't.
         #
         # For WHEEL installs, sparselab/_core.so and torch/ live
         # next to each other inside site-packages, so the relative
@@ -314,14 +337,20 @@ class BuildExtWithRepair(build_ext):
         # the source tree (e.g. /path/to/repo/sparselab/_core.so)
         # while torch is in site-packages — they are NOT siblings,
         # so @loader_path/../torch/lib resolves to a nonexistent
-        # directory. To keep editable installs working we also add
-        # an ABSOLUTE rpath pointing at torch/lib in the current
-        # Python environment. This absolute path is a
-        # development-only artifact: it's baked into your local .so
-        # and isn't a problem because the .so itself lives in your
-        # repo, not in a distributed wheel. Wheel builds still use
-        # scripts/repair_wheel_macos.sh, which actively strips
-        # absolute rpaths before publishing.
+        # directory. We also add an ABSOLUTE rpath pointing at
+        # torch/lib in the current Python environment as a hint.
+        # This absolute path is a development-only artifact: it's
+        # baked into your local .so and isn't a problem because the
+        # .so itself lives in your repo, not in a distributed wheel.
+        # Wheel builds still use scripts/repair_wheel_macos.sh,
+        # which actively strips absolute rpaths before publishing.
+        #
+        # On the GitHub macos-14 CI runner, neither rpath addition
+        # actually survives into the final editable-install .so
+        # (pip's editable pipeline appears to copy/regenerate the
+        # binary from somewhere else). That's exactly why we no
+        # longer rely on them — see configure_openmp() above for
+        # the link-time fix that does the actual work.
         #
         # We check each rpath before adding to avoid
         # "file already has LC_RPATH for" errors on incremental builds.
