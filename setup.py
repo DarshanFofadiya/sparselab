@@ -284,24 +284,30 @@ class BuildExtWithRepair(build_ext):
         if not os.path.isfile(so_path):
             return
 
-        # Find the current libomp install name (if any). Absolute
-        # Homebrew paths will be rewritten; already-relative @rpath
-        # references are left alone.
+        # Find the current libomp install_name (if any) referenced by
+        # the .so, so we can rewrite it. We match any absolute path
+        # ending in `/libomp.dylib`. Empirically observed candidates
+        # on macOS:
+        #   /opt/homebrew/opt/libomp/lib/libomp.dylib  (Homebrew)
+        #   /usr/local/opt/libomp/lib/libomp.dylib     (Homebrew Intel)
+        #   /opt/llvm-openmp/lib/libomp.dylib          (torch's bundled
+        #                                               libomp inherits
+        #                                               this install_name)
+        # An already-rewritten `@rpath/libomp.dylib` is left alone
+        # (no leading `/`, so it won't match).
         otool_out = subprocess.run(
             ["otool", "-L", so_path],
             check=False, capture_output=True, text=True,
         ).stdout
-        homebrew_libomp = None
+        existing_libomp = None
         for line in otool_out.splitlines():
             line = line.strip()
-            # Match /opt/homebrew/opt/libomp/lib/libomp.dylib
-            # or    /usr/local/opt/libomp/lib/libomp.dylib
-            if line.startswith(("/opt/homebrew/opt/libomp/",
-                                "/usr/local/opt/libomp/")):
-                homebrew_libomp = line.split(" ")[0]
+            tok = line.split(" ", 1)[0] if line else ""
+            if tok.startswith("/") and tok.endswith("/libomp.dylib"):
+                existing_libomp = tok
                 break
 
-        if homebrew_libomp is None:
+        if existing_libomp is None:
             return  # already @rpath-style, or no libomp linked
 
         # Issue #18 fix
@@ -365,12 +371,12 @@ class BuildExtWithRepair(build_ext):
         new_install_name = editable_install_target or "@rpath/libomp.dylib"
         print(
             f"[sparselab] rewriting libomp install name: "
-            f"{homebrew_libomp} -> {new_install_name}",
+            f"{existing_libomp} -> {new_install_name}",
             file=sys.stderr,
         )
         subprocess.run(
             ["install_name_tool", "-change",
-             homebrew_libomp, new_install_name, so_path],
+             existing_libomp, new_install_name, so_path],
             check=True,
         )
 
