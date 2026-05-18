@@ -1,9 +1,9 @@
 # SparseLab
 
-![v0.2](https://img.shields.io/badge/version-0.2.0-blue)
+![v0.2](https://img.shields.io/badge/version-0.2.1-blue)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![PyPI](https://img.shields.io/pypi/v/sparselab)
-![tests](https://img.shields.io/badge/tests-372%20passing-brightgreen)
+![tests](https://img.shields.io/badge/tests-442%20passing-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/DarshanFofadiya/sparselab/blob/main/examples/colab_try_sparselab.ipynb)
 
@@ -37,12 +37,24 @@ at training time, on commodity hardware.
   on a MacBook CPU: 37% of dense memory, quality tracking dense,
   real sparse storage end-to-end. Not a simulation.
 
-- **v0.2 scales it to clusters.** CPU-cluster data parallelism
-  turns "1B dense model → 100M live sparse" into a realistic
-  workload on commodity CPU infrastructure. A 10-machine CPU
-  cluster with 128 GB RAM each is a few thousand dollars; an
-  8×H100 DGX node that handles an equivalent dense workload
-  runs $300K+ upfront or $20K+/month in the cloud.
+- **v0.2 makes the kernels actually fast on every supported CPU.**
+  Hand-written NEON dW (Apple Silicon + Linux aarch64, milestone 12)
+  and AVX2 dW (Linux x86_64, milestone 14) deliver
+  **3.0× end-to-end** sparse training speedup at 40M-param transformer
+  scale on x86 and **~2× end-to-end** on Apple Silicon. Forward
+  SpMM is fast cross-platform — auto-vectorized to ~50 GF/s on
+  Zen 4 once the `-march=x86-64-v3` flag landed in milestone 14;
+  [milestone 15](docs/demos/milestone_15.md) measured this and
+  retired a planned hand-written AVX2 forward kernel because the
+  compiler had already done the work. Training dynamics unchanged —
+  same seed produces identical val loss to four decimal places.
+
+- **v0.2 also lays the path to clusters.** CPU-cluster data
+  parallelism turns "1B dense model → 100M live sparse" into a
+  realistic workload on commodity CPU infrastructure. A 10-machine
+  CPU cluster with 128 GB RAM each is a few thousand dollars; an
+  8×H100 DGX node that handles an equivalent dense workload runs
+  $300K+ upfront or $20K+/month in the cloud.
 
 - **It's also a hardware problem, not just software.** GPUs are
   built for dense; sparse accelerators have no training stack to
@@ -55,7 +67,7 @@ building toward purpose-built sparse hardware.
 
 **Get it:** `pip install sparselab`. Pre-built wheels for macOS
 arm64 and Linux x86_64/aarch64, Python 3.11–3.13. MIT license.
-372 tests including autograd gradcheck.
+442 tests including autograd gradcheck.
 
 ---
 
@@ -66,7 +78,7 @@ gap:
 
 | Project | Storage | Training | Hardware | `pip install` on a laptop |
 |-|-|-|-|-|
-| **SparseLab** (us) | **Real sparse (Padded-CSR)** | **From scratch, pluggable DST** | **CPU (NEON + OpenMP)** | **Yes** |
+| **SparseLab** (us) | **Real sparse (Padded-CSR)** | **From scratch, pluggable DST** | **CPU (NEON + AVX2 + OpenMP)** | **Yes** |
 | Cerebras `cstorch.sparse` | Dense + mask | From scratch, pluggable DST | Wafer-scale only | No |
 | Neural Magic SparseML | Dense + mask | Post-training pruning | CPU (inference) | Yes (inference only) |
 | rigl-torch | Dense + mask | From scratch, RigL only | CPU/GPU | Yes (mask-simulated) |
@@ -179,11 +191,15 @@ What becomes possible on top of this foundation:
 
 ---
 
-## Current results (v0.1)
+## Foundational results (v0.1)
 
 10M-parameter decoder-only transformer (6 layers, d_model=384),
 trained from scratch on Tiny Shakespeare for 10,000 steps on an
-M3 Pro MacBook:
+M3 Pro MacBook. These are the v0.1 quality numbers that the
+v0.2.x kernel work was built on top of — they're the proof that
+actually-sparse training reaches dense quality, not the latest
+performance numbers (see [Performance progression](#performance-progression--v01--v022)
+for those):
 
 | | Dense | Sparse FFN 90% | Sparse all (attn 70% + FFN 90%) |
 |-|-|-|-|
@@ -199,36 +215,46 @@ inference, 31% at training.** Real, at-rest, not simulated.
 — within noise for char-level language modeling at this scale. No
 sparse-specific pathology. Full writeup: [`docs/demos/milestone_10.md`](docs/demos/milestone_10.md).
 
-### On speed: honest, not apologetic
+### On speed: where we are now
 
-We're slower per step than dense on CPU today — 2.4× for FFN-only
-sparsity, 4.6× for all-sparse. This is a real cost and we don't
-hide it.
+v0.1 was 2.4× slower than dense per step (FFN-only) and 4.6× slower
+(all-sparse) on CPU. The v0.2.x kernel work has narrowed that
+significantly — measured numbers in the
+[Performance progression](#performance-progression--v01--v022) table
+above (3.0× end-to-end speedup on Linux x86_64, ~2× on Apple
+Silicon, both vs the v0.1 scalar baseline).
 
-It's also a solvable problem. Three things will change it:
+We are still slower per step than a dense GPU on small models;
+that's a real cost and we don't hide it. Two things continue to
+narrow the gap:
 
-1. **The NEON `dW` kernel is not yet hand-tuned** (Clang
-   auto-vectorization only). Planned v0.2 work: ~1.3–1.5×
-   end-to-end speedup at FFN scale.
-2. **Sparse kernels have fixed per-layer overhead.** At the matrix
-   sizes in this demo, that overhead dominates. It doesn't at
+1. **Sparse kernels have fixed per-layer overhead.** At the matrix
+   sizes in v0.1's demos, that overhead dominates. It does not at
    larger scale — the break-even point is when weight matrices
-   become memory-bandwidth bound, typically ~1024+ hidden size
-   and above.
-3. **Per-step speed is not the right frame.** CPU-cluster data
-   parallelism (v0.2 roadmap) changes the scaling story entirely.
-   See "The trajectory" below.
+   become memory-bandwidth bound, typically ~1024+ hidden size and
+   above.
+2. **Per-step speed is not the only frame.** CPU-cluster data
+   parallelism (next on the roadmap) changes the scaling story
+   entirely — see "The trajectory" below.
 
 ---
 
 ## The trajectory
 
-v0.1 runs on one machine. That's the proof-of-concept phase — show
-that actually-sparse training works, make it a real library, ship
-it with wheels, tests, and demos.
+v0.1 ran on one machine. That was the proof-of-concept phase — show
+that actually-sparse training works, ship a real library with
+wheels, tests, and demos.
 
-**v0.2 adds data parallelism across CPU cores and machines.** This
-is the scaling story that matters:
+**v0.2.x has been the kernel-performance phase.** Hand-written NEON
+dW (Apple Silicon + Linux aarch64, milestone 12) and AVX2 dW
+(Linux x86_64, milestone 14) brought sparse training within 2–3×
+of v0.1's dense-equivalent step times — see
+[Performance progression](#performance-progression--v01--v022).
+
+**Data parallelism across CPU cores and machines** is the next
+phase, tracked as
+[issue #4](https://github.com/DarshanFofadiya/sparselab/issues/4).
+This is the scaling story that matters:
 
 - 1B dense parameters at 90% sparsity = 100M live weights.
 - 100M live weights ≈ 400 MB at training-time precision. Fits in
@@ -273,7 +299,8 @@ eventually scale into specialized hardware.
   today, and larger with v0.2 DDP.
 - **Contributors who care about low-level performance.** The SpMM
   and dW kernels are the moats; every optimization compounds
-  forever. NEON today, AVX-512 and ARM server-class tomorrow.
+  forever. NEON + AVX2 today; AVX-512 dW for newer Intel/AMD parts
+  and ARM SVE for server-class arm tomorrow.
 - **Anyone curious about sparse-first ML.** The code is
   intentionally readable and well-commented. A grad student can
   read the NEON inner loop and understand it.
@@ -355,23 +382,36 @@ pip install sparselab
 ```
 
 Pre-built wheels are published for the following platforms, with
-OpenMP and the NEON/scalar kernels bundled inside — no system
-libraries to install, no compiler required:
+OpenMP and the SIMD kernels bundled inside — no system libraries to
+install, no compiler required:
 
-| Platform | Arch | Python versions | Kernel |
+| Platform | Arch | Python versions | Kernels |
 |-|-|-|-|
-| macOS | arm64 (Apple Silicon) | 3.11, 3.12, 3.13 | NEON + OpenMP |
-| Linux | x86_64 (manylinux) | 3.11, 3.12, 3.13 | scalar + OpenMP |
-| Linux | aarch64 (manylinux) | 3.11, 3.12, 3.13 | NEON + OpenMP |
+| macOS | arm64 (Apple Silicon) | 3.11, 3.12, 3.13 | NEON forward + NEON dW + OpenMP |
+| Linux | x86_64 (manylinux, Haswell/Zen 1+) | 3.11, 3.12, 3.13 | AVX2+FMA dW (hand-written) + AVX2 forward (auto-vec at `-march=x86-64-v3`) + OpenMP |
+| Linux | aarch64 (manylinux, ARMv8.2-A+) | 3.11, 3.12, 3.13 | NEON forward + NEON dW + OpenMP |
 
-**Windows & Intel Mac:** not yet. Native Windows wheels are planned
-for v0.2. Intel Mac wheels are paused while we wait for GitHub's
-replacement Intel CI runner — we don't ship what we can't test on
-real hardware. In the meantime:
-- **Windows users:** use [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install)
+**Minimum CPU requirement on Linux x86_64:** Haswell (Intel, 2013+) or
+Zen 1 (AMD, 2017+). The `-march=x86-64-v3` build target emits AVX2 +
+FMA instructions; pre-2013 x86 CPUs will hit `Illegal instruction` at
+import. Every Linux distribution currently supported by PyTorch 2.8+
+targets Haswell+ / Zen+ in practice. (See CHANGELOG `[Unreleased]` /
+v0.2.2 for the rationale.)
+
+**Windows & Intel Mac:** not yet, and Intel Mac is unlikely.
+- **Windows users:** native Windows wheels are tracked as
+  [issue #8](https://github.com/DarshanFofadiya/sparselab/issues/8).
+  In the meantime use [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install)
   with our Linux wheel — that path works today.
-- **Intel Mac users:** build from source (see "Development install"
-  below). It takes ~45 seconds on any modern Mac.
+- **Intel Mac users:** [upstream PyTorch deprecated macOS x86_64 wheels
+  in January 2024](https://dev-discuss.pytorch.org/t/pytorch-macos-x86-builds-deprecation-starting-january-2024/1690)
+  and the last torch release published for Intel Mac is 2.2.2. We can
+  build a SparseLab wheel for the platform, but `pip install` can't
+  resolve our `torch>=2.8` requirement on it — the wheel would be
+  unusable. Workaround: build SparseLab from sdist with `torch<=2.2.2`
+  pinned (`pip install torch==2.2.2 && pip install sparselab --no-binary sparselab`).
+  Requires a C++ toolchain. See CHANGELOG v0.1.1 "Investigated but not
+  shipped" for the full reasoning.
 
 If you're on a platform not in the table above, pip falls back to
 compiling from source. For that you'll need:
@@ -391,17 +431,29 @@ For hacking on SparseLab itself:
 git clone https://github.com/DarshanFofadiya/sparselab.git
 cd sparselab
 brew install libomp        # macOS only
-pip install -e '.[dev]'
+
+# Pre-install build deps into the runtime env, then editable install
+# with --no-build-isolation. The flag is REQUIRED on macOS (see
+# docs/development.md for why) and recommended everywhere for speed
+# and consistency.
+pip install --upgrade setuptools wheel pybind11 'torch>=2.8'
+pip install -e '.[dev]' --no-build-isolation
 ```
 
 The editable install rebuilds the C++ kernels whenever you touch a
 file in `csrc/`. First build takes ~45 seconds.
 
+**If `pip install -e '.[dev]'` fails on macOS with `ImportError:
+Library not loaded: @rpath/libomp.dylib`, you forgot
+`--no-build-isolation`.** The full reasoning + recovery commands are
+in [`docs/development.md`](docs/development.md). [`CONTRIBUTING.md`](CONTRIBUTING.md)
+has the dev quickstart.
+
 ### Verify install
 
 ```python
 import sparselab
-print(sparselab.__version__)          # should print 0.2.0 or newer
+print(sparselab.__version__)          # should print 0.2.1 or newer
 
 # Quick smoke test — this should run in under a second
 import torch
@@ -415,12 +467,12 @@ If you installed from source, the full test suite is also available:
 
 ```bash
 pytest
-# 372 passed in ~3s
+# 442 passed, ~3s on Apple Silicon / ~5s on Linux x86
 ```
 
 If something doesn't work, please [open an issue with the output](https://github.com/DarshanFofadiya/sparselab/issues)
-— v0.1 is the first time other people are installing this, so we
-want to hear about failures.
+— we want to hear about install failures, especially on platforms
+or environments we may not have tested.
 
 ### Install troubleshooting
 
@@ -464,14 +516,21 @@ source ~/my-sparselab-env/bin/activate
 pip install sparselab
 ```
 
-**macOS: `Symbol not found` or `OMP: Error #15: Initializing libomp.dylib`**
+**macOS: `Symbol not found`, `OMP: Error #15`, or `ImportError: @rpath/libomp.dylib`**
 
-If you see this on import, two copies of libomp are being loaded in
-the same process. Our wheel is designed to reuse torch's libomp, so
-this shouldn't happen from `pip install sparselab` alone. Most
-likely you have a non-standard `DYLD_LIBRARY_PATH` or a global libomp
-install that the dynamic loader is finding first. Try a fresh venv
-with no environment overrides.
+PyPI wheels reuse PyTorch's bundled libomp at import time, so this
+should not happen from a plain `pip install sparselab`. The two
+common causes if it does:
+
+- **You're running an editable install (`pip install -e .`) without
+  `--no-build-isolation`.** That flag is required on macOS for the
+  reasons documented in
+  [`docs/development.md`](docs/development.md#why---no-build-isolation-matters-on-macos).
+  Recovery is one command: `pip install -e '.[dev]'
+  --no-build-isolation --force-reinstall`.
+- **A non-standard `DYLD_LIBRARY_PATH`** or a global libomp install
+  that the macOS dynamic loader is finding first. Try a fresh venv
+  with no environment overrides.
 
 **Rosetta Python on an M-series Mac**
 
@@ -499,6 +558,59 @@ python --version
 python -c "import platform; print(platform.machine(), platform.platform())"
 pip --version
 pip debug --verbose 2>&1 | grep -A 3 "Compatible tags" | head -8
+```
+
+---
+
+## Performance progression — v0.1 → v0.2.2
+
+End-to-end speedups vs. the v0.1.x scalar baseline, measured on the
+same hardware in each row. All numbers come from
+`.github/workflows/validate_40m_scalar.yml` (Gate F2) at 40M-param
+mini-GPT scale: 8 layers, d_model=640, d_ff=2560, FFN 90% sparse,
+200 SGD steps, fixed seed. Same training dynamics — bit-stable val
+loss to four decimal places across every row below.
+
+| Platform | Pre-v0.2 (scalar) | Post-v0.2.2 (SIMD) | Speedup | What shipped |
+|-|-|-|-|-|
+| **Apple Silicon** (M3 Pro, 6 perf cores) | ~110 ms/step | **~56 ms/step** | **~1.96×** | NEON `dW` kernel ([milestone 12](docs/demos/milestone_12.md)) |
+| **Linux x86_64** (Zen 4 on GitHub Actions, 2 vCPUs) | 4316 ms/step | **1436 ms/step** | **~3.0×** | AVX2+FMA `dW` kernel ([milestone 14](docs/demos/milestone_14.md)) + auto-vectorized AVX2 forward via `-march=x86-64-v3` ([milestone 15](docs/demos/milestone_15.md)) |
+| **Linux aarch64** (Graviton-class, 4 cores) | not directly Gate-F2-measured at 40M | (~1.7–2.2× extrapolated from milestone 13's per-layer numbers) | NEON `dW` kernel — same code path as Apple Silicon |
+
+Notes on what those speedups *are*:
+
+- **Per-step wallclock**, not per-FFN-layer. Per-layer kernel
+  speedups are larger (e.g., AVX2 dW is 12–13× per layer on Zen 4)
+  but Amdahl-bounded by the embedding / attention / softmax / loss
+  share of a step.
+- **Same correctness bar.** All three platforms still pass the full
+  442-test suite at `rtol=atol=1e-5` against PyTorch oracles, plus
+  `torch.autograd.gradcheck` at default tolerances.
+- **x86 forward SpMM also got fast as a side effect** of milestone
+  14's `-march=x86-64-v3` flag — Clang auto-vectorized the
+  forward AXPY inner loop to ~50 GF/s on Zen 4. That's why
+  milestone 15 retired a planned hand-written AVX2 forward
+  kernel; the compiler had already done the work and a hand kernel
+  only delivered 1.20–1.33× over auto-vec.
+
+What didn't change between v0.1 and v0.2.2:
+
+- **The Padded-CSR memory footprint.** 90%-sparse 40M-param model
+  still uses ~37% of dense memory. The v0.2.x work is purely
+  speed; storage cost was already settled in v0.1.
+- **The Python API.** `sparselab.spmm`, `SparseLinear`,
+  `SparsityAlgorithm`, `Static` / `SET` / `RigL` are all unchanged
+  from v0.1.x. Users on `kernel="auto"` (the default) pick up the
+  speedup transparently — no code change required.
+
+Reproduce the x86 numbers:
+
+```bash
+gh workflow run "Validate 40M scalar baseline" --ref main
+# Wait ~30 minutes, then:
+gh run list --workflow="validate_40m_scalar.yml" --limit 1
+gh run download <run-id> --dir ./validate-artifacts
+cat ./validate-artifacts/validate-40m-x86_64/validate_40m.txt
 ```
 
 ---
@@ -535,74 +647,107 @@ pip install -e '.[demos]'
 
 - `sparselab.PaddedCSR` — sparse storage with O(1) slot insert,
   cached transpose, round-trip with `torch.sparse_csr`.
-- `sparselab.spmm(W, X)` — sparse-dense matmul with NEON + OpenMP,
-  autograd-aware.
+- `sparselab.spmm(W, X)` — sparse-dense matmul, autograd-aware.
+  Forward and backward are both vectorized: NEON on Apple Silicon
+  + Linux aarch64, AVX2+FMA on Linux x86_64, scalar fallback on
+  unrecognized platforms. OpenMP-parallel over the row dimension.
 - `sparselab.SparseLinear(nn.Module)` — drop-in `nn.Linear`
   replacement. Standard `nn.Parameter`, standard `state_dict`.
 - `sparselab.SparsityAlgorithm`, `Static`, `SET`, `RigL` — pluggable
   DST API. Inspired by Cerebras's `cstorch.sparse.SparsityAlgorithm`;
   see `docs/LANDSCAPE.md`.
-- 372 tests, including gradcheck against PyTorch autograd and
-  dense-equivalence oracles at 1e-5 tolerance.
+- 442 tests, including gradcheck against PyTorch autograd and
+  dense-equivalence oracles at 1e-5 tolerance. CI gates on three
+  required platforms: macOS-arm64, Linux x86_64, Linux aarch64.
 - 15 demos, end-to-end from "hello pybind" through "10M-param
   mini-GPT trained on Shakespeare at 90% sparsity."
 
 ## Known limitations (we'd rather tell you upfront)
 
-- **Single machine only** in v0.1. Multi-machine DDP is the
-  v0.2 roadmap's headline item.
-- **CPU only.** GPU is a v0.3+ contribution target.
-- **Slower per-step than dense on small models.** Explained above;
-  v0.2 dW kernel work narrows the gap significantly.
+- **Single machine only** in v0.2. Multi-machine DDP
+  ([issue #4](https://github.com/DarshanFofadiya/sparselab/issues/4))
+  is the next major scaling step.
+- **CPU only.** GPU is a v0.3+ contribution target
+  ([issue #3](https://github.com/DarshanFofadiya/sparselab/issues/3)).
+- **Slower per-step than dense on small models** below ~50% sparsity.
+  Padded-CSR's per-live-weight column-index overhead doesn't pay off
+  there. At FFN-shape, 90%-sparse training step is now ~3× the
+  scalar baseline on x86 and ~2× on Apple Silicon.
+- **Pre-2013 x86 CPUs not supported.** The Linux x86_64 wheel
+  requires AVX2 + FMA (Haswell / Zen 1+).
 - **Transpose cache has a theoretical `id()` collision risk** when a
   `PaddedCSR` is garbage-collected and Python reuses its id for a new
   same-shape, same-topology-version CSR. Documented in
   `sparselab/ops.py`; has not been observed in practice but is real.
-- **`dW` kernel isn't NEON-vectorized yet** — it relies on Clang's
-  auto-vectorization at `-O3`. A hand-tuned NEON dW is the top v0.2
-  speedup target.
-- **Sparse attention is not a primitive** in v0.1. We verified it
+- **No AVX-512 yet** ([issue #3 / v0.3 scope](https://github.com/DarshanFofadiya/sparselab/issues/3)).
+  AVX-512 is worth pursuing for the dW kernel (compute-bound,
+  headroom remains); for forward SpMM the bottleneck is store-port
+  bandwidth, not FMA — see [milestone 15](docs/demos/milestone_15.md).
+- **Sparse attention is not a primitive** in v0.2. We verified it
   works end-to-end (see demo_14 and demo_15 all-sparse) but didn't
-  promote it to a first-class API.
+  promote it to a first-class API
+  ([issue #9](https://github.com/DarshanFofadiya/sparselab/issues/9)).
 - **Fixed row capacity in Padded-CSR.** Each row's capacity is frozen
   at layer construction (initial `nnz × 1.2`). This gives us O(1)
   insertion during topology mutation. Algorithms that grow a row's
   live count beyond initial capacity will fail — SET and RigL work
   fine because they keep per-row `nnz` constant. Adaptive-density
-  DST would need a `compact_all()` primitive. Planned v0.2.
+  DST would need a `compact_all()` primitive
+  ([issue #6](https://github.com/DarshanFofadiya/sparselab/issues/6)).
 
 ---
 
 ## Roadmap
 
-**v0.1 (this release).** The pluggable DST foundation. Kernels,
-storage, autograd, `SparseLinear`, `SparsityAlgorithm` base,
+**v0.1 (shipped).** The pluggable DST foundation. Kernels, storage,
+autograd, `SparseLinear`, `SparsityAlgorithm` base,
 `Static` / `SET` / `RigL`, end-to-end 10M-param transformer demo,
 pre-built PyPI wheels for macOS and Linux.
 
-**v0.2 (next ~4–6 weeks).** The scaling and optimization phase.
-- **CPU-cluster data parallelism via PyTorch DDP.** This is the
-  one that changes what's possible: training 100M-param-live
-  sparse models (1B dense equivalent) across commodity CPU
-  clusters that cost a few thousand dollars.
-- **Hand-tuned NEON `dW` kernel.** 1.3–1.5× end-to-end speedup
-  at FFN scale.
-- **Buffer reuse / arena in the backward path.**
-- **Parallelism tuning** (`schedule(dynamic)` experiments for
-  uneven nnz distributions).
-- **AVX-512 kernels for x86** (excellent community contribution
-  target).
-- **`PaddedCSR.compact_all()` primitive** for adaptive-density
-  DST algorithms.
-- **Windows native wheels.**
-- **Intel Mac wheels** (once GitHub's replacement runner ships).
-- **More DST algorithms** — Sparse Momentum, adaptive-sparsity
-  variants — from community PRs.
+**v0.2 (in progress).** The performance and scaling phase.
+- ✅ **Hand-tuned NEON `dW` kernel.** Shipped in v0.2.1 (milestone
+  12). 1.96× end-to-end on Apple Silicon at 40M-param transformer
+  scale; ~6.5× per-layer dW.
+- ✅ **AVX2 + FMA `dW` kernel for Linux x86_64.** Shipped in v0.2.2
+  (milestone 14). 3.0× end-to-end on Zen 4 CI runners; 12–13×
+  per-layer dW. `-march=x86-64-v3` raised the x86 scalar baseline
+  ~13× as a side effect, making forward SpMM auto-vectorize cleanly
+  ([milestone 15](docs/demos/milestone_15.md) measured this and
+  retired a planned hand-written AVX2 forward kernel).
+- ✅ **macOS editable-install libomp double-load fix.** Shipped in
+  v0.2.2 (issue #18). macOS-arm64 is now a required gated CI leg.
+- 🚧 **README + docs refresh, version bump, v0.2.2 tag.**
+- 📋 **CPU-cluster data parallelism via PyTorch DDP**
+  ([issue #4](https://github.com/DarshanFofadiya/sparselab/issues/4)).
+  The biggest scaling step: training 100M-param-live sparse models
+  (1B dense equivalent) across commodity CPU clusters that cost a
+  few thousand dollars.
+- 📋 **Buffer reuse / arena in the backward path**
+  ([issue #7](https://github.com/DarshanFofadiya/sparselab/issues/7)).
+- 📋 **`PaddedCSR.compact_all()` primitive** for adaptive-density
+  DST algorithms
+  ([issue #6](https://github.com/DarshanFofadiya/sparselab/issues/6)).
+- 📋 **Windows native wheels**
+  ([issue #8](https://github.com/DarshanFofadiya/sparselab/issues/8)).
+- 📋 **More DST algorithms** — Sparse Momentum
+  ([#5](https://github.com/DarshanFofadiya/sparselab/issues/5)),
+  Top-KAST ([#12](https://github.com/DarshanFofadiya/sparselab/issues/12))
+  — from community PRs.
 
 **v0.3 (post-launch community phase).**
-- **Memory-mapped weights** for models that exceed node RAM.
-- **Sparse attention as a first-class primitive.**
-- **GPU backend** as a community-led contribution opportunity.
+- **AVX-512 dW kernel for newer Intel/AMD CPUs**
+  ([issue #3 covers GPU; AVX-512 lives in the same v0.3 scope](https://github.com/DarshanFofadiya/sparselab/issues/3)).
+  AVX-512 is worth pursuing for compute-bound dW, NOT for
+  forward SpMM — store-port bandwidth is the bottleneck on
+  current Intel/AMD silicon, and AVX-512 doesn't increase
+  store bandwidth (see [milestone 15](docs/demos/milestone_15.md)
+  for the bandwidth-ceiling analysis).
+- **Memory-mapped weights** for models that exceed node RAM
+  ([#14](https://github.com/DarshanFofadiya/sparselab/issues/14)).
+- **Sparse attention as a first-class primitive**
+  ([#9](https://github.com/DarshanFofadiya/sparselab/issues/9)).
+- **GPU backend** as a community-led contribution opportunity
+  ([#3](https://github.com/DarshanFofadiya/sparselab/issues/3)).
 - **Hardware-vendor partnerships** for sparse accelerators once
   the software stack proves itself at scale.
 
@@ -623,13 +768,26 @@ Full details: `docs/LANDSCAPE.md`.
 
 ## Documentation
 
-- `docs/PROJECT_OVERVIEW.md` — project thesis and architecture.
-- `docs/LANDSCAPE.md` — honest survey of the sparse-ML ecosystem.
-- `docs/design/*.md` — design docs written before the code they
-  describe (Padded-CSR, SpMM, SparseLinear, Router, RigL).
-- `docs/demos/milestone_*.md` — per-milestone writeups with measured
-  results and text samples. The v0.1 launch artifact is
-  [`milestone_10.md`](docs/demos/milestone_10.md).
+- [`docs/PROJECT_OVERVIEW.md`](docs/PROJECT_OVERVIEW.md) — project thesis and architecture.
+- [`docs/LANDSCAPE.md`](docs/LANDSCAPE.md) — honest survey of the sparse-ML ecosystem.
+- [`docs/development.md`](docs/development.md) — canonical
+  editable-install setup (especially the `--no-build-isolation`
+  story on macOS) and developer troubleshooting.
+- [`docs/design/*.md`](docs/design/) — design docs written before
+  the code they describe (Padded-CSR, SpMM, SparseLinear, Router,
+  RigL, NEON dW, AVX2 dW, retired AVX2 forward).
+- [`docs/demos/milestone_*.md`](docs/demos/) — per-milestone writeups
+  with measured results and text samples. Highlights:
+  - [`milestone_10.md`](docs/demos/milestone_10.md) — the v0.1
+    launch artifact (10M-param transformer end-to-end).
+  - [`milestone_12.md`](docs/demos/milestone_12.md) — NEON dW
+    kernel, ~2× end-to-end on Apple Silicon.
+  - [`milestone_14.md`](docs/demos/milestone_14.md) — AVX2 dW
+    kernel, 3.0× end-to-end on Linux x86_64.
+  - [`milestone_15.md`](docs/demos/milestone_15.md) — measurement
+    and learning milestone: x86 forward SpMM is already
+    AVX2-fast, so a planned hand-written AVX2 forward kernel was
+    retired with documented reasoning.
 
 ---
 
