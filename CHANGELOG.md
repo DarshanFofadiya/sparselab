@@ -7,6 +7,10 @@ Versioning: [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+_No changes since v0.2.2._
+
+## [0.2.2] — 2026-05-18
+
 **AVX2 SIMD kernel for `dW` on Linux x86_64 — closes the Linux-parity
 gap from milestone 13. Sparse-from-scratch training on x86 is now
 **~3× faster end-to-end** at 40M-param transformer scale (per-step
@@ -15,7 +19,11 @@ FFN layer the dW kernel itself is 12-13× faster than scalar. Training
 dynamics unchanged — same seed produces identical val loss to four
 decimal places.**
 
-Closes #2.
+This release also fixes the macOS editable-install double-libomp
+crash that was tracked in issue #18: macOS-arm64 is now a fully-green
+required CI gate alongside Linux x86_64 and Linux aarch64.
+
+Closes #2 and #18.
 
 ### Added
 - AVX2 + FMA implementation of `spmm_grad_w` for x86_64 builds.
@@ -51,6 +59,24 @@ Closes #2.
 - `docs/demos/milestone_14.md` — measured 3.0× end-to-end speedup,
   12-13× per-layer, val-loss delta = 0.0000 nats across 200 SGD
   steps.
+- `docs/demos/milestone_15.md` — measurement-and-learning milestone
+  documenting that x86 forward SpMM is already AVX2-fast via Clang
+  auto-vectorization at `-march=x86-64-v3`. Includes Gate F1
+  artifacts (x86 + aarch64), the bandwidth-ceiling analysis, and
+  the v0.3 scoping note (AVX-512 forward likely not worth shipping
+  for the same store-port-bandwidth reason).
+- `docs/development.md` — canonical reference for editable-install
+  setup. Explains why `pip install -e '.[dev]' --no-build-isolation`
+  is the recommended (and on macOS, required) command, what symptom
+  appears if you forget the flag, how wheel installs differ, and
+  troubleshooting commands for diagnosing libomp resolution issues.
+- `tests/test_spmm_avx2.py` — 46 AVX2-specific tests for the
+  forward kernel scaffold, retained as a future-proofing asset
+  after the hand-written kernel was retired in milestone 15.
+  Skipped/aliasing on x86_64 today (both scalar and simd paths
+  route to scalar after the retirement); the tests trivially pass
+  and are ready to re-engage if a v0.3 AVX-512 or layout-change
+  effort revisits this code path.
 
 ### Changed
 - `setup.py` on x86_64 builds now compiles with `-march=x86-64-v3`.
@@ -64,9 +90,33 @@ Closes #2.
   to the AVX2 kernel on x86. The Python-facing symbol
   `_core.spmm_grad_w_simd` is unchanged; on ARM64 it still routes
   to NEON, on pre-AVX2 x86 to scalar.
-- Test suite: 442 → **486 passed** on Linux x86_64 (44 new AVX2
-  tests). On ARM64 stays at 442 passed + 44 skipped (AVX2 tests
-  skip cleanly).
+- macOS editable installs: `setup.py`'s `BuildExtWithRepair` now
+  rewrites the compiled `.so`'s libomp install_name to the absolute
+  path of torch's bundled libomp at build time (the editable case),
+  while keeping `@rpath/libomp.dylib` for wheel builds (handled by
+  `scripts/repair_wheel_macos.sh` post-build). The Homebrew rpath
+  that previously got baked in via `-Wl,-rpath,$hb_lib` is no
+  longer emitted at link time. The install_name detector in
+  `BuildExtWithRepair` now matches any absolute `*/libomp.dylib`,
+  not just Homebrew prefixes — necessary because torch's bundled
+  libomp carries its own `/opt/llvm-openmp/...` install_name.
+  Together these changes make `pip install -e '.[dev]'
+  --no-build-isolation` produce a working `.so` on the GitHub
+  `macos-14` runner, closing issue #18.
+- `pip install -e '.[dev]'` developer command now requires
+  `--no-build-isolation` on macOS (it was already recommended on
+  Linux for speed). The full reasoning is in
+  [`docs/development.md`](docs/development.md). `CONTRIBUTING.md`
+  quickstart updated to use this canonical flow.
+- Test suite: now **488 passed** on Linux x86_64 (44 dW AVX2 tests
+  + 46 forward AVX2 scaffold tests, all green; the 46 forward tests
+  trivially pass post-milestone-15 retirement and are ready to
+  re-engage when a v0.3 AVX-512 effort revisits the code path).
+  macOS-arm64 reports **441 passed, 93 skipped** (the AVX2 tests
+  skip on non-x86, and `test_spmm_rejects_non_cpu_X` correctly
+  skips when MPS allocation is not actually usable on the runner).
+  Linux aarch64 reports **442 passed, 92 skipped** (NEON path,
+  AVX2 tests skip).
 
 ### Breaking
 - **Minimum x86 CPU requirement: Haswell (Intel, 2013+) or Zen 1
@@ -84,6 +134,22 @@ Closes #2.
 - CI Test workflow (`.github/workflows/test.yml`) now exercises
   the AVX2 kernel on every push. Linux aarch64's NEON numbers
   verified unchanged vs milestone 13 (si/sc within 5%).
+- **macOS-arm64 is now a fully required CI gate** alongside Linux
+  x86_64 and Linux aarch64. The `continue-on-error: true` workaround
+  and the `KMP_DUPLICATE_LIB_OK=TRUE` env var (both added when
+  issue #18 was open) are gone. The macOS leg now genuinely blocks
+  on failure for every push and pull request.
+- `tests/test_spmm.py::test_spmm_rejects_non_cpu_X` skip gate
+  changed from `torch.backends.mps.is_available()` to a probe-based
+  detector that attempts a 1-element MPS allocation. Reason: the
+  GitHub `macos-14` runner advertises MPS but allocation segfaults.
+  The probe-based gate skips cleanly there while still running the
+  test on developer Macs that actually have working MPS.
+- README refreshed for the v0.2.x story: cross-platform AVX2
+  narrative, post-march scalar measurements, three-platform support
+  table, the `--no-build-isolation` developer flow, performance
+  progression table (v0.1 → v0.2.2 end-to-end speedups). Internal
+  contradictions vs the older v0.1-era prose resolved.
 
 ### Investigated but not shipped
 - **Hand-written AVX2 forward SpMM kernel.** Designed, implemented,
